@@ -33,6 +33,7 @@ import (
 	lksdk "github.com/livekit/server-sdk-go/v2"
 
 	"github.com/livekit/sip/pkg/errors"
+	"github.com/livekit/sip/pkg/pcap"
 )
 
 const (
@@ -109,6 +110,9 @@ type Config struct {
 	ServiceName string `yaml:"-"`
 	NodeID      string // Do not provide, will be overwritten
 
+	// PCAP capture configuration for debugging SIP calls
+	PCAP pcap.Config `yaml:"pcap"`
+
 	// Experimental, these option might go away without notice.
 	Experimental struct {
 		// InboundWaitACK forces SIP to wait for an ACK to 200 OK before proceeding with the call.
@@ -122,6 +126,7 @@ func NewConfig(confString string) (*Config, error) {
 		ApiSecret:   os.Getenv("LIVEKIT_API_SECRET"),
 		WsUrl:       os.Getenv("LIVEKIT_WS_URL"),
 		ServiceName: "sip",
+		PCAP:        pcap.DefaultConfig(),
 	}
 	if confString != "" {
 		if err := yaml.Unmarshal([]byte(confString), conf); err != nil {
