@@ -41,6 +41,7 @@ import (
 	"github.com/livekit/sipgo/sip"
 
 	"github.com/livekit/sip/pkg/config"
+	"github.com/livekit/sip/pkg/pcap"
 	"github.com/livekit/sip/pkg/stats"
 )
 
@@ -80,11 +81,12 @@ type outboundCall struct {
 	jitterBuf bool
 	projectID string
 
-	mu       sync.RWMutex
-	mon      *stats.CallMonitor
-	lkRoom   RoomInterface
-	lkRoomIn msdk.PCM16Writer // output to room; OPUS at 48k
-	sipConf  sipOutboundConfig
+	mu         sync.RWMutex
+	mon        *stats.CallMonitor
+	lkRoom     RoomInterface
+	lkRoomIn   msdk.PCM16Writer // output to room; OPUS at 48k
+	sipConf    sipOutboundConfig
+	pcapWriter *pcap.SessionWriter
 }
 
 func (c *Client) newCall(ctx context.Context, tid traceid.ID, conf *config.Config, log logger.Logger, id LocalTag, room RoomConfig, sipConf sipOutboundConfig, state *CallState, projectID string) (*outboundCall, error) {
@@ -114,6 +116,16 @@ func (c *Client) newCall(ctx context.Context, tid traceid.ID, conf *config.Confi
 	}
 	call.stats.Update()
 	call.log = call.log.WithValues("jitterBuf", call.jitterBuf)
+
+	// Initialize PCAP capture if enabled
+	if conf.PCAP.Enabled {
+		pw, err := pcap.NewSessionWriter(log, conf.PCAP, string(id), state.callInfo.CallId, "", projectID)
+		if err != nil {
+			log.Warnw("Failed to create PCAP writer", err)
+		} else {
+			call.pcapWriter = pw
+		}
+	}
 	call.cc = c.newOutbound(log, id, URI{
 		User:      sipConf.from,
 		Host:      sipConf.host,
@@ -150,6 +162,11 @@ func (c *Client) newCall(ctx context.Context, tid traceid.ID, conf *config.Confi
 	call.media.SetDTMFAudio(conf.AudioDTMF)
 	call.media.EnableTimeout(false)
 	call.media.DisableOut() // disabled until we get 200
+
+	// Attach PCAP writer for RTP capture if enabled
+	if call.pcapWriter != nil {
+		call.media.SetPCAPWriter(call.pcapWriter)
+	}
 	if err := call.connectToRoom(ctx, room, c.getRoom); err != nil {
 		call.close(errors.Wrap(err, "room join failed"), callDropped, "join-failed", livekit.DisconnectReason_UNKNOWN_REASON)
 		return nil, fmt.Errorf("update room failed: %w", err)
@@ -337,16 +354,25 @@ func (c *outboundCall) close(err error, status CallStatus, description string, r
 
 		c.c.DeregisterTransferSIPParticipant(string(c.cc.ID()))
 
+		// Close PCAP writer
+		var pcapPath string
+		if c.pcapWriter != nil {
+			pcapPath = c.pcapWriter.FilePath()
+			_ = c.pcapWriter.Close()
+			c.pcapWriter = nil
+		}
+
 		// Call the handler asynchronously to avoid blocking
 		if c.c.handler != nil {
-			go func(tid traceid.ID) {
+			go func(tid traceid.ID, pcapPath string) {
 				c.c.handler.OnSessionEnd(context.Background(), &CallIdentifier{
 					TraceID:   tid,
 					ProjectID: c.projectID,
 					CallID:    c.state.callInfo.CallId,
 					SipCallID: c.cc.SIPCallID(),
+					PCAPPath:  pcapPath,
 				}, c.state.callInfo, description)
-			}(c.tid)
+			}(c.tid, pcapPath)
 		}
 	})
 }

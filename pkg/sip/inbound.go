@@ -48,6 +48,7 @@ import (
 	"github.com/livekit/sipgo/sip"
 
 	"github.com/livekit/sip/pkg/config"
+	"github.com/livekit/sip/pkg/pcap"
 	"github.com/livekit/sip/pkg/stats"
 	"github.com/livekit/sip/res"
 )
@@ -601,6 +602,7 @@ type inboundCall struct {
 	stats       Stats
 	jitterBuf   bool
 	projectID   string
+	pcapWriter  *pcap.SessionWriter
 }
 
 func (s *Server) newInboundCall(
@@ -630,6 +632,17 @@ func (s *Server) newInboundCall(
 	}
 	c.stats.Update()
 	c.setLog(log.WithValues("jitterBuf", c.jitterBuf))
+
+	// Initialize PCAP capture if enabled
+	if s.conf.PCAP.Enabled {
+		pw, err := pcap.NewSessionWriter(log, s.conf.PCAP, string(cc.ID()), call.LkCallId, cc.SIPCallID(), "")
+		if err != nil {
+			log.Warnw("Failed to create PCAP writer", err)
+		} else {
+			c.pcapWriter = pw
+		}
+	}
+
 	// we need it created earlier so that the audio mixer is available for pin prompts
 	c.lkRoom = s.getRoom(c.log(), &c.stats.Room)
 	c.ctx, c.cancel = context.WithCancel(context.Background())
@@ -954,6 +967,11 @@ func (c *inboundCall) runMediaConn(tid traceid.ID, offerData []byte, enc livekit
 	c.media.DisableOut()         // disabled until we send 200
 	c.media.SetDTMFAudio(conf.AudioDTMF)
 
+	// Attach PCAP writer for RTP capture if enabled
+	if c.pcapWriter != nil {
+		c.media.SetPCAPWriter(c.pcapWriter)
+	}
+
 	answer, mconf, err := mp.SetOffer(offerData, e)
 	if err != nil {
 		return nil, SDPError{Err: err}
@@ -1153,15 +1171,24 @@ func (c *inboundCall) close(error bool, status CallStatus, reason string) {
 
 	c.s.DeregisterTransferSIPParticipant(c.cc.ID())
 
+	// Close PCAP writer
+	var pcapPath string
+	if c.pcapWriter != nil {
+		pcapPath = c.pcapWriter.FilePath()
+		_ = c.pcapWriter.Close()
+		c.pcapWriter = nil
+	}
+
 	// Call the handler asynchronously to avoid blocking
 	if c.s.handler != nil {
-		go func(tid traceid.ID) {
+		go func(tid traceid.ID, pcapPath string) {
 			c.s.handler.OnSessionEnd(context.Background(), &CallIdentifier{
 				ProjectID: c.projectID,
 				CallID:    c.call.LkCallId,
 				SipCallID: c.call.SipCallId,
+				PCAPPath:  pcapPath,
 			}, c.state.callInfo, reason)
-		}(c.tid)
+		}(c.tid, pcapPath)
 	}
 
 	c.cancel()

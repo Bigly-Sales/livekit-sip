@@ -114,6 +114,7 @@ type CallIdentifier struct {
 	ProjectID string
 	CallID    string
 	SipCallID string
+	PCAPPath  string // Path to the PCAP file for this call, if any
 }
 
 type Handler interface {

@@ -38,6 +38,7 @@ import (
 	"github.com/livekit/protocol/logger"
 	"github.com/livekit/protocol/utils/traceid"
 
+	"github.com/livekit/sip/pkg/pcap"
 	"github.com/livekit/sip/pkg/stats"
 )
 
@@ -287,6 +288,7 @@ type MediaPort struct {
 	mon              *stats.CallMonitor
 	externalIP       netip.Addr
 	port             *udpConn
+	captureConn      *pcap.CaptureConn // for PCAP capture
 	mediaReceived    core.Fuse
 	packetCount      atomic.Uint64
 	mediaTimeout     <-chan struct{}
@@ -298,6 +300,7 @@ type MediaPort struct {
 	stats            *PortStats
 	dtmfAudioEnabled bool
 	jitterEnabled    bool
+	pcapWriter       atomic.Pointer[pcap.SessionWriter]
 
 	mu           sync.Mutex
 	conf         *MediaConf
@@ -496,7 +499,27 @@ func (p *MediaPort) Close() {
 		if hnd != nil {
 			(*hnd).Close()
 		}
+
+		// Close PCAP writer if set
+		if pw := p.pcapWriter.Swap(nil); pw != nil {
+			_ = pw.Close()
+		}
 	})
+}
+
+// SetPCAPWriter sets the PCAP writer for RTP packet capture
+func (p *MediaPort) SetPCAPWriter(w *pcap.SessionWriter) {
+	if w != nil {
+		p.pcapWriter.Store(w)
+		if p.captureConn != nil {
+			p.captureConn.SetWriter(w)
+		}
+	}
+}
+
+// GetPCAPWriter returns the current PCAP writer
+func (p *MediaPort) GetPCAPWriter() *pcap.SessionWriter {
+	return p.pcapWriter.Load()
 }
 
 func (p *MediaPort) Port() int {
