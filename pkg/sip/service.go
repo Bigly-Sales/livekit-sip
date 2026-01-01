@@ -176,6 +176,13 @@ func (s *Service) ActiveCalls() ActiveCalls {
 	return st
 }
 
+// StartDrain stops accepting new SIP calls (both inbound and outbound) but keeps existing calls
+// and listeners open. This allows the service to gracefully drain while completing ongoing calls.
+func (s *Service) StartDrain() {
+	s.cli.StartDrain()
+	s.srv.StartDrain()
+}
+
 func (s *Service) Stop() {
 	s.cli.Stop()
 	s.srv.Stop()

@@ -782,3 +782,261 @@ func TestCANCELSendsBothResponses(t *testing.T) {
 	// Verify we received the critical 487 response
 	require.True(t, invite487Received, "Should have received 487 Request Terminated response to INVITE when CANCEL is sent")
 }
+
+func TestServer_StartDrain(t *testing.T) {
+	sipPort := rand.Intn(testPortSIPMax-testPortSIPMin) + testPortSIPMin
+
+	mon, err := stats.NewMonitor(&config.Config{MaxCpuUtilization: 0.9})
+	require.NoError(t, err)
+
+	log := logger.LogRLogger(logr.Discard())
+	s, err := NewService("", &config.Config{
+		SIPPort:       sipPort,
+		SIPPortListen: sipPort,
+		RTPPort:       rtcconfig.PortRange{Start: testPortRTPMin, End: testPortRTPMax},
+	}, mon, log, func(projectID string) rpc.IOInfoClient { return nil })
+	require.NoError(t, err)
+	t.Cleanup(s.Stop)
+
+	require.NoError(t, s.Start())
+
+	// Verify closing fuse is not broken initially
+	require.False(t, s.srv.closing.IsBroken(), "closing fuse should not be broken initially")
+
+	// Start draining
+	s.srv.StartDrain()
+
+	// Verify closing fuse is now broken
+	require.True(t, s.srv.closing.IsBroken(), "closing fuse should be broken after StartDrain()")
+
+	// Verify listeners are still open (not closed)
+	require.NotNil(t, s.srv.sipListeners, "listeners should still exist")
+	require.Greater(t, len(s.srv.sipListeners), 0, "listeners should still be open")
+}
+
+func TestClient_StartDrain(t *testing.T) {
+	sipPort := rand.Intn(testPortSIPMax-testPortSIPMin) + testPortSIPMin
+
+	mon, err := stats.NewMonitor(&config.Config{MaxCpuUtilization: 0.9})
+	require.NoError(t, err)
+
+	log := logger.LogRLogger(logr.Discard())
+	s, err := NewService("", &config.Config{
+		SIPPort:       sipPort,
+		SIPPortListen: sipPort,
+		RTPPort:       rtcconfig.PortRange{Start: testPortRTPMin, End: testPortRTPMax},
+	}, mon, log, func(projectID string) rpc.IOInfoClient { return nil })
+	require.NoError(t, err)
+	t.Cleanup(s.Stop)
+
+	require.NoError(t, s.Start())
+
+	// Verify closing fuse is not broken initially
+	require.False(t, s.cli.closing.IsBroken(), "closing fuse should not be broken initially")
+
+	// Start draining
+	s.cli.StartDrain()
+
+	// Verify closing fuse is now broken
+	require.True(t, s.cli.closing.IsBroken(), "closing fuse should be broken after StartDrain()")
+}
+
+func TestService_StartDrain(t *testing.T) {
+	sipPort := rand.Intn(testPortSIPMax-testPortSIPMin) + testPortSIPMin
+
+	mon, err := stats.NewMonitor(&config.Config{MaxCpuUtilization: 0.9})
+	require.NoError(t, err)
+
+	log := logger.LogRLogger(logr.Discard())
+	s, err := NewService("", &config.Config{
+		SIPPort:       sipPort,
+		SIPPortListen: sipPort,
+		RTPPort:       rtcconfig.PortRange{Start: testPortRTPMin, End: testPortRTPMax},
+	}, mon, log, func(projectID string) rpc.IOInfoClient { return nil })
+	require.NoError(t, err)
+	t.Cleanup(s.Stop)
+
+	require.NoError(t, s.Start())
+
+	// Verify closing fuses are not broken initially
+	require.False(t, s.srv.closing.IsBroken(), "server closing fuse should not be broken initially")
+	require.False(t, s.cli.closing.IsBroken(), "client closing fuse should not be broken initially")
+
+	// Start draining via Service
+	s.StartDrain()
+
+	// Verify both closing fuses are now broken
+	require.True(t, s.srv.closing.IsBroken(), "server closing fuse should be broken after StartDrain()")
+	require.True(t, s.cli.closing.IsBroken(), "client closing fuse should be broken after StartDrain()")
+}
+
+func TestServer_RejectInviteWhenDraining(t *testing.T) {
+	const (
+		expectedFromUser = "foo"
+		expectedToUser   = "bar"
+	)
+
+	h := &TestHandler{
+		GetAuthCredentialsFunc: func(ctx context.Context, call *rpc.SIPCall) (AuthInfo, error) {
+			return AuthInfo{Result: AuthAccept}, nil
+		},
+		DispatchCallFunc: func(ctx context.Context, info *CallInfo) CallDispatch {
+			return CallDispatch{
+				Result: DispatchAccept,
+				Room: RoomConfig{
+					RoomName: "test-room",
+					Participant: ParticipantConfig{
+						Identity: "test-participant",
+					},
+				},
+			}
+		},
+	}
+
+	sipPort := rand.Intn(testPortSIPMax-testPortSIPMin) + testPortSIPMin
+	localIP, err := config.GetLocalIP()
+	require.NoError(t, err)
+
+	sipServerAddress := fmt.Sprintf("%s:%d", localIP, sipPort)
+
+	mon, err := stats.NewMonitor(&config.Config{MaxCpuUtilization: 0.9})
+	require.NoError(t, err)
+
+	log := logger.LogRLogger(logr.Discard())
+	s, err := NewService("", &config.Config{
+		SIPPort:       sipPort,
+		SIPPortListen: sipPort,
+		RTPPort:       rtcconfig.PortRange{Start: testPortRTPMin, End: testPortRTPMax},
+	}, mon, log, func(projectID string) rpc.IOInfoClient { return nil })
+	require.NoError(t, err)
+	t.Cleanup(s.Stop)
+
+	s.SetHandler(h)
+	require.NoError(t, s.Start())
+
+	// Start draining before sending INVITE
+	s.srv.StartDrain()
+
+	sipUserAgent, err := sipgo.NewUA(
+		sipgo.WithUserAgent(expectedFromUser),
+		sipgo.WithUserAgentLogger(slog.New(logger.ToSlogHandler(log))),
+	)
+	require.NoError(t, err)
+
+	sipClient, err := sipgo.NewClient(sipUserAgent)
+	require.NoError(t, err)
+
+	offer, err := sdp.NewOffer(localIP, 0xB0B, sdp.EncryptionNone)
+	require.NoError(t, err)
+	offerData, err := offer.SDP.Marshal()
+	require.NoError(t, err)
+
+	inviteRecipent := sip.Uri{User: expectedToUser, Host: sipServerAddress}
+	inviteRequest := sip.NewRequest(sip.INVITE, inviteRecipent)
+	inviteRequest.SetDestination(sipServerAddress)
+	inviteRequest.SetBody(offerData)
+	inviteRequest.AppendHeader(sip.NewHeader("Content-Type", "application/sdp"))
+
+	tx, err := sipClient.TransactionRequest(inviteRequest)
+	require.NoError(t, err)
+	t.Cleanup(tx.Terminate)
+
+	// Should receive 503 Service Unavailable immediately
+	res := getResponseOrFail(t, tx)
+	require.Equal(t, sip.StatusCode(503), res.StatusCode, "Should reject INVITE with 503 when draining")
+	require.Contains(t, res.Reason, "Service Unavailable", "Response reason should indicate service unavailable")
+}
+
+func TestServer_AcceptInviteBeforeDraining(t *testing.T) {
+	const (
+		expectedFromUser = "foo"
+		expectedToUser   = "bar"
+	)
+
+	callAccepted := make(chan struct{}, 1)
+	h := &TestHandler{
+		GetAuthCredentialsFunc: func(ctx context.Context, call *rpc.SIPCall) (AuthInfo, error) {
+			return AuthInfo{Result: AuthAccept}, nil
+		},
+		DispatchCallFunc: func(ctx context.Context, info *CallInfo) CallDispatch {
+			select {
+			case callAccepted <- struct{}{}:
+			default:
+			}
+			return CallDispatch{
+				Result: DispatchAccept,
+				Room: RoomConfig{
+					RoomName: "test-room",
+					Participant: ParticipantConfig{
+						Identity: "test-participant",
+					},
+				},
+			}
+		},
+	}
+
+	sipPort := rand.Intn(testPortSIPMax-testPortSIPMin) + testPortSIPMin
+	localIP, err := config.GetLocalIP()
+	require.NoError(t, err)
+
+	sipServerAddress := fmt.Sprintf("%s:%d", localIP, sipPort)
+
+	mon, err := stats.NewMonitor(&config.Config{MaxCpuUtilization: 0.9})
+	require.NoError(t, err)
+
+	log := logger.LogRLogger(logr.Discard())
+	s, err := NewService("", &config.Config{
+		SIPPort:       sipPort,
+		SIPPortListen: sipPort,
+		RTPPort:       rtcconfig.PortRange{Start: testPortRTPMin, End: testPortRTPMax},
+	}, mon, log, func(projectID string) rpc.IOInfoClient { return nil })
+	require.NoError(t, err)
+	t.Cleanup(s.Stop)
+
+	s.SetHandler(h)
+	require.NoError(t, s.Start())
+
+	sipUserAgent, err := sipgo.NewUA(
+		sipgo.WithUserAgent(expectedFromUser),
+		sipgo.WithUserAgentLogger(slog.New(logger.ToSlogHandler(log))),
+	)
+	require.NoError(t, err)
+
+	sipClient, err := sipgo.NewClient(sipUserAgent)
+	require.NoError(t, err)
+
+	offer, err := sdp.NewOffer(localIP, 0xB0B, sdp.EncryptionNone)
+	require.NoError(t, err)
+	offerData, err := offer.SDP.Marshal()
+	require.NoError(t, err)
+
+	inviteRecipent := sip.Uri{User: expectedToUser, Host: sipServerAddress}
+	inviteRequest := sip.NewRequest(sip.INVITE, inviteRecipent)
+	inviteRequest.SetDestination(sipServerAddress)
+	inviteRequest.SetBody(offerData)
+	inviteRequest.AppendHeader(sip.NewHeader("Content-Type", "application/sdp"))
+
+	tx, err := sipClient.TransactionRequest(inviteRequest)
+	require.NoError(t, err)
+	t.Cleanup(tx.Terminate)
+
+	// Should accept INVITE before draining
+	res := getResponseOrFail(t, tx)
+	require.Equal(t, sip.StatusCode(100), res.StatusCode, "Should send 100 Trying")
+
+	// Wait for call to be accepted
+	select {
+	case <-callAccepted:
+		// Call was accepted, good
+	case <-time.After(2 * time.Second):
+		t.Fatal("Call should have been accepted")
+	}
+
+	// Now start draining - existing call should continue
+	s.srv.StartDrain()
+	require.True(t, s.srv.closing.IsBroken(), "Should be draining")
+
+	// Verify listeners are still open (existing call can continue)
+	require.NotNil(t, s.srv.sipListeners, "Listeners should still be open during drain")
+	require.Greater(t, len(s.srv.sipListeners), 0, "Listeners should still be open during drain")
+}

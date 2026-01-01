@@ -89,6 +89,13 @@ func (v CallStatus) SIPStatus() (sip.StatusCode, string) {
 	switch v {
 	default:
 		return sip.StatusBusyHere, "Rejected"
+	case CallHangup, callHangupMedia, callDropped:
+		// Call was terminated before being answered - use 480 Temporarily Unavailable
+		// This is more appropriate than 486 Busy Here for cases where the room/agent
+		// became unavailable during call setup
+		return sip.StatusTemporarilyUnavailable, "Temporarily Unavailable"
+	case callUnavailable:
+		return sip.StatusTemporarilyUnavailable, "User Unavailable"
 	case callMediaFailed:
 		return sip.StatusNotAcceptableHere, "MediaFailed"
 	}

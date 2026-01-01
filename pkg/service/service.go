@@ -41,6 +41,7 @@ import (
 )
 
 type sipServiceStopFunc func()
+type sipServiceStartDrainFunc func()
 type sipServiceActiveCallsFunc func() sip.ActiveCalls
 
 type Service struct {
@@ -57,6 +58,7 @@ type Service struct {
 	rpcSIPServer rpc.SIPInternalServer
 
 	sipServiceStop        sipServiceStopFunc
+	sipServiceStartDrain  sipServiceStartDrainFunc
 	sipServiceActiveCalls sipServiceActiveCallsFunc
 
 	mon      *stats.Monitor
@@ -66,7 +68,7 @@ type Service struct {
 
 func NewService(
 	conf *config.Config, log logger.Logger, srv rpc.SIPInternalServerImpl, sipServiceStop sipServiceStopFunc,
-	sipServiceActiveCalls sipServiceActiveCallsFunc, cli rpc.IOInfoClient, bus psrpc.MessageBus, mon *stats.Monitor,
+	sipServiceStartDrain sipServiceStartDrainFunc, sipServiceActiveCalls sipServiceActiveCallsFunc, cli rpc.IOInfoClient, bus psrpc.MessageBus, mon *stats.Monitor,
 ) *Service {
 	s := &Service{
 		conf: conf,
@@ -77,7 +79,8 @@ func NewService(
 		bus:         bus,
 
 		sipServiceStop:        sipServiceStop,
-		sipServiceActiveCalls: sipServiceActiveCalls,
+		sipServiceStartDrain:   sipServiceStartDrain,
+		sipServiceActiveCalls:  sipServiceActiveCalls,
 
 		mon: mon,
 	}
@@ -106,7 +109,7 @@ func NewService(
 			Handler: mux,
 		}
 
-		mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		healthHandler := func(w http.ResponseWriter, r *http.Request) {
 			st := s.Health()
 			var code int
 			switch st {
@@ -120,7 +123,9 @@ func NewService(
 			w.Header().Set("Content-Type", "text/plain")
 			w.WriteHeader(code)
 			_, _ = w.Write([]byte(st.String()))
-		})
+		}
+		mux.HandleFunc("/", healthHandler)
+		mux.HandleFunc("/healthz", healthHandler)
 	}
 	return s
 }
@@ -184,6 +189,13 @@ func (s *Service) Run() error {
 		case <-s.shutdown.Watch():
 			s.log.Infow("shutting down")
 			s.DeregisterCreateSIPParticipantTopic()
+			
+			// Start draining: stop accepting new SIP calls immediately
+			// This ensures Azure LB stops routing new traffic even while waiting for existing calls to finish
+			if s.sipServiceStartDrain != nil {
+				s.log.Infow("starting drain: rejecting new SIP calls")
+				s.sipServiceStartDrain()
+			}
 
 			if !s.killed.Load() {
 				shutdownTicker := time.NewTicker(5 * time.Second)
@@ -205,6 +217,16 @@ func (s *Service) Run() error {
 			}
 
 			s.sipServiceStop()
+			
+			// Keep health server running for a grace period to allow load balancer
+			// to detect unhealthy status. Health endpoint already returns 503.
+			// This ensures Azure LB has time to mark the instance as unhealthy
+			// before the health server is closed.
+			if s.healthServer != nil {
+				s.log.Infow("waiting for load balancer to detect unhealthy status", "grace_period", "30s")
+				time.Sleep(30 * time.Second)
+			}
+			
 			return nil
 		}
 	}
