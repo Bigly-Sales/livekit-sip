@@ -282,11 +282,18 @@ func (s *Service) Start() error {
 }
 
 func (s *Service) CreateSIPParticipant(ctx context.Context, req *rpc.InternalCreateSIPParticipantRequest) (*rpc.InternalCreateSIPParticipantResponse, error) {
+	if s.conf.DisableOutboundCalls {
+		return nil, psrpc.NewErrorf(psrpc.Unimplemented, "outbound calls are disabled on this instance")
+	}
 	resp, err := s.cli.CreateSIPParticipant(ctx, req)
 	return resp, siperrors.ApplySIPStatus(err)
 }
 
 func (s *Service) CreateSIPParticipantAffinity(ctx context.Context, req *rpc.InternalCreateSIPParticipantRequest) float32 {
+	if s.conf.DisableOutboundCalls {
+		// Return 0 affinity when outbound calls are disabled to prevent routing to this instance
+		return 0
+	}
 	// TODO: scale affinity based on a number or active calls?
 	return 0.5
 }

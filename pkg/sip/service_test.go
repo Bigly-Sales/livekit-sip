@@ -2,6 +2,7 @@ package sip
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"math/rand"
@@ -17,6 +18,7 @@ import (
 	"github.com/livekit/protocol/livekit"
 	"github.com/livekit/protocol/logger"
 	"github.com/livekit/protocol/rpc"
+	"github.com/livekit/psrpc"
 	"github.com/livekit/sipgo"
 	"github.com/livekit/sipgo/sip"
 
@@ -1039,4 +1041,161 @@ func TestServer_AcceptInviteBeforeDraining(t *testing.T) {
 	// Verify listeners are still open (existing call can continue)
 	require.NotNil(t, s.srv.sipListeners, "Listeners should still be open during drain")
 	require.Greater(t, len(s.srv.sipListeners), 0, "Listeners should still be open during drain")
+}
+
+func TestService_DisableOutboundCalls(t *testing.T) {
+	sipPort := rand.Intn(testPortSIPMax-testPortSIPMin) + testPortSIPMin
+
+	mon, err := stats.NewMonitor(&config.Config{MaxCpuUtilization: 0.9})
+	require.NoError(t, err)
+
+	log := logger.LogRLogger(logr.Discard())
+	s, err := NewService("", &config.Config{
+		SIPPort:             sipPort,
+		SIPPortListen:       sipPort,
+		RTPPort:             rtcconfig.PortRange{Start: testPortRTPMin, End: testPortRTPMax},
+		DisableOutboundCalls: true,
+	}, mon, log, func(projectID string) rpc.IOInfoClient { return nil })
+	require.NoError(t, err)
+	t.Cleanup(s.Stop)
+
+	require.NoError(t, s.Start())
+
+	// Verify client is still started (needed for handling responses)
+	require.NotNil(t, s.cli, "Client should still be initialized")
+	require.NotNil(t, s.cli.sipCli, "Client SIP client should still be started")
+
+	// Verify server is started
+	require.NotNil(t, s.srv, "Server should be initialized")
+	require.NotNil(t, s.srv.sipListeners, "Server listeners should be started")
+
+	// Try to create an outbound call - should be rejected
+	req := &rpc.InternalCreateSIPParticipantRequest{
+		CallTo:              "+1234567890",
+		Address:             "sip.example.com",
+		Number:              "+0987654321",
+		RoomName:            "test-room",
+		ParticipantIdentity: "test-participant",
+		SipCallId:           "test-call-id",
+		Transport:           livekit.SIPTransport_SIP_TRANSPORT_UDP,
+		WsUrl:               "ws://localhost:7880",
+		Token:               "test-token",
+	}
+
+	resp, err := s.CreateSIPParticipant(context.Background(), req)
+	require.Error(t, err, "CreateSIPParticipant should fail when outbound is disabled")
+	require.Nil(t, resp, "Response should be nil on error")
+
+	// Verify it's an Unimplemented error
+	var psrpcErr psrpc.Error
+	require.True(t, errors.As(err, &psrpcErr), "Error should be a psrpc error")
+	require.Equal(t, psrpc.Unimplemented, psrpcErr.Code(), "Error code should be Unimplemented")
+	require.Contains(t, psrpcErr.Error(), "outbound calls are disabled", "Error message should mention outbound calls are disabled")
+}
+
+func TestService_DisableOutboundCalls_Affinity(t *testing.T) {
+	sipPort := rand.Intn(testPortSIPMax-testPortSIPMin) + testPortSIPMin
+
+	mon, err := stats.NewMonitor(&config.Config{MaxCpuUtilization: 0.9})
+	require.NoError(t, err)
+
+	log := logger.LogRLogger(logr.Discard())
+	s, err := NewService("", &config.Config{
+		SIPPort:             sipPort,
+		SIPPortListen:       sipPort,
+		RTPPort:             rtcconfig.PortRange{Start: testPortRTPMin, End: testPortRTPMax},
+		DisableOutboundCalls: true,
+	}, mon, log, func(projectID string) rpc.IOInfoClient { return nil })
+	require.NoError(t, err)
+	t.Cleanup(s.Stop)
+
+	require.NoError(t, s.Start())
+
+	// Verify affinity returns 0 when outbound is disabled
+	req := &rpc.InternalCreateSIPParticipantRequest{
+		CallTo:              "+1234567890",
+		Address:             "sip.example.com",
+		Number:              "+0987654321",
+		RoomName:            "test-room",
+		ParticipantIdentity: "test-participant",
+		SipCallId:           "test-call-id",
+	}
+
+	affinity := s.CreateSIPParticipantAffinity(context.Background(), req)
+	require.Equal(t, float32(0), affinity, "Affinity should be 0 when outbound calls are disabled")
+}
+
+func TestService_DisableOutboundCalls_InboundStillWorks(t *testing.T) {
+	const (
+		expectedFromUser = "foo"
+		expectedToUser   = "bar"
+	)
+
+	h := &TestHandler{
+		GetAuthCredentialsFunc: func(ctx context.Context, call *rpc.SIPCall) (AuthInfo, error) {
+			return AuthInfo{Result: AuthAccept}, nil
+		},
+		DispatchCallFunc: func(ctx context.Context, info *CallInfo) CallDispatch {
+			return CallDispatch{
+				Result: DispatchAccept,
+				Room: RoomConfig{
+					RoomName: "test-room",
+					Participant: ParticipantConfig{
+						Identity: "test-participant",
+					},
+				},
+			}
+		},
+	}
+
+	sipPort := rand.Intn(testPortSIPMax-testPortSIPMin) + testPortSIPMin
+	localIP, err := config.GetLocalIP()
+	require.NoError(t, err)
+
+	sipServerAddress := fmt.Sprintf("%s:%d", localIP, sipPort)
+
+	mon, err := stats.NewMonitor(&config.Config{MaxCpuUtilization: 0.9})
+	require.NoError(t, err)
+
+	log := logger.LogRLogger(logr.Discard())
+	s, err := NewService("", &config.Config{
+		SIPPort:             sipPort,
+		SIPPortListen:       sipPort,
+		RTPPort:             rtcconfig.PortRange{Start: testPortRTPMin, End: testPortRTPMax},
+		DisableOutboundCalls: true,
+	}, mon, log, func(projectID string) rpc.IOInfoClient { return nil })
+	require.NoError(t, err)
+	t.Cleanup(s.Stop)
+
+	s.SetHandler(h)
+	require.NoError(t, s.Start())
+
+	// Verify inbound calls still work
+	sipUserAgent, err := sipgo.NewUA(
+		sipgo.WithUserAgent(expectedFromUser),
+		sipgo.WithUserAgentLogger(slog.New(logger.ToSlogHandler(log))),
+	)
+	require.NoError(t, err)
+
+	sipClient, err := sipgo.NewClient(sipUserAgent)
+	require.NoError(t, err)
+
+	offer, err := sdp.NewOffer(localIP, 0xB0B, sdp.EncryptionNone)
+	require.NoError(t, err)
+	offerData, err := offer.SDP.Marshal()
+	require.NoError(t, err)
+
+	inviteRecipent := sip.Uri{User: expectedToUser, Host: sipServerAddress}
+	inviteRequest := sip.NewRequest(sip.INVITE, inviteRecipent)
+	inviteRequest.SetDestination(sipServerAddress)
+	inviteRequest.SetBody(offerData)
+	inviteRequest.AppendHeader(sip.NewHeader("Content-Type", "application/sdp"))
+
+	tx, err := sipClient.TransactionRequest(inviteRequest)
+	require.NoError(t, err)
+	t.Cleanup(tx.Terminate)
+
+	// Should accept inbound INVITE (not reject)
+	res := getResponseOrFail(t, tx)
+	require.Equal(t, sip.StatusCode(100), res.StatusCode, "Should send 100 Trying for inbound call")
 }
