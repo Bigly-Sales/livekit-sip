@@ -929,10 +929,20 @@ func (c *sipOutbound) AcceptReInvite(req *sip.Request, tx sip.ServerTransaction)
 	c.mu.RLock()
 	// Get our SDP from the original INVITE OK response
 	var sdp []byte
+	var hasInviteOk bool
 	if c.inviteOk != nil {
 		sdp = c.inviteOk.Body()
+		hasInviteOk = true
 	}
+	callID := c.callID
+	tag := c.tag
 	c.mu.RUnlock()
+
+	c.log.Infow("AcceptReInvite: preparing 200 OK response",
+		"sipCallID", callID,
+		"remoteTag", tag,
+		"hasInviteOk", hasInviteOk,
+		"sdpSize", len(sdp))
 
 	// Respond with 200 OK and our SDP
 	resp := sip.NewResponseFromRequest(req, sip.StatusOK, "OK", sdp)
@@ -940,7 +950,12 @@ func (c *sipOutbound) AcceptReInvite(req *sip.Request, tx sip.ServerTransaction)
 	resp.AppendHeader(c.contact)
 
 	if err := tx.Respond(resp); err != nil {
-		c.log.Warnw("failed to respond to RE-INVITE", err)
+		c.log.Warnw("AcceptReInvite: failed to send 200 OK response", err,
+			"sipCallID", callID)
+	} else {
+		c.log.Infow("AcceptReInvite: successfully sent 200 OK response",
+			"sipCallID", callID,
+			"sdpSize", len(sdp))
 	}
 }
 

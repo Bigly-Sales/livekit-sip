@@ -339,22 +339,36 @@ func (c *Client) onInvite(req *sip.Request, tx sip.ServerTransaction) bool {
 	// Get SIP Call-ID to look up existing outbound call
 	callIDHeader := req.CallID()
 	if callIDHeader == nil {
+		c.log.Debugw("onInvite: no Call-ID header in request")
 		return false
 	}
 	sipCallID := callIDHeader.Value()
 
+	// Get CSeq for logging
+	var cseq uint32
+	if cseqHeader := req.CSeq(); cseqHeader != nil {
+		cseq = cseqHeader.SeqNo
+	}
+
 	c.cmu.Lock()
 	call := c.byCallID[sipCallID]
+	numOutboundCalls := len(c.byCallID)
 	c.cmu.Unlock()
 
 	if call == nil {
 		// Not an outbound call we know about
+		c.log.Debugw("onInvite: no outbound call found for SIP Call-ID",
+			"sipCallID", sipCallID,
+			"cseq", cseq,
+			"numOutboundCalls", numOutboundCalls)
 		return false
 	}
 
 	// This is a RE-INVITE for an outbound call
-	call.log.Infow("RE-INVITE from remote for outbound call",
+	call.log.Infow("RE-INVITE received for outbound call",
 		"sipCallID", sipCallID,
+		"cseq", cseq,
+		"fromTag", call.cc.Tag(),
 		"content-type", req.ContentType(),
 		"content-length", req.ContentLength())
 
