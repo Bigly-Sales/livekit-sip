@@ -358,10 +358,19 @@ func (s *Server) processInvite(req *sip.Request, tx sip.ServerTransaction) (retE
 	existing := s.byCallID[cc.SIPCallID()]
 	s.cmu.RUnlock()
 	if existing != nil && existing.cc.InviteCSeq() < cc.InviteCSeq() {
+		// RE-INVITE for an inbound call - handle as keep-alive
 		log.Infow("accepting reinvite", "sipCallID", existing.cc.ID(), "content-type", req.ContentType(), "content-length", req.ContentLength())
 		existing.log().Infow("reinvite", "content-type", req.ContentType(), "content-length", req.ContentLength(), "cseq", cc.InviteCSeq())
 		cc.AcceptAsKeepAlive(existing.cc.OwnSDP())
 		return nil
+	}
+
+	// Check if this is a RE-INVITE for an outbound call (handled by Client)
+	if existing == nil && s.sipUnhandled != nil {
+		if s.sipUnhandled(req, tx) {
+			log.Infow("reinvite handled by client (outbound call)", "sipCallID", cc.SIPCallID())
+			return nil
+		}
 	}
 
 	from, to := cc.From(), cc.To()
