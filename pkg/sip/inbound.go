@@ -81,6 +81,9 @@ func hashPassword(password string) string {
 	return hex.EncodeToString(hash[:8]) // Use first 8 bytes for shorter hash
 }
 
+// generateNonce creates a unique nonce for digest authentication challenges.
+// Includes both timestamp and Call-ID to ensure uniqueness even when multiple
+// challenges are generated in the same microsecond.
 func generateNonce(sipCallID string) string {
 	return fmt.Sprintf("%d-%s", time.Now().UnixMicro(), sipCallID)
 }
@@ -1351,6 +1354,8 @@ func (c *inboundCall) handleReinvite(req *sip.Request, tx sip.ServerTransaction)
 			r := sip.NewResponseFromRequest(req, sip.StatusOK, "OK", sdp)
 			r.AppendHeader(&contentTypeHeaderSDP)
 			_ = tx.Respond(r)
+		} else {
+			c.log().Warnw("retransmission: no SDP available, not responding", nil)
 		}
 		return
 	}
@@ -1374,14 +1379,14 @@ func (c *inboundCall) handleReinvite(req *sip.Request, tx sip.ServerTransaction)
 	// TODO: Support SDP renegotiation if needed in the future
 	//       This would require parsing the offer, updating media session, etc.
 
-	r := sip.NewResponseFromRequest(req, sip.StatusOK, "OK", currentSDP)
-	r.AppendHeader(&contentTypeHeaderSDP)
+	// Create a temporary sipInbound for the re-INVITE to properly handle the response
+	// This ensures all headers (Allow, Contact, etc.) are added correctly
+	tr := callTransportFromReq(req)
+	legTr := legTransportFromReq(req)
+	reinviteCC := c.s.newInbound(c.log(), c.cc.tag, c.s.ContactURI(legTr), req, tx, nil)
 
-	err := tx.Respond(r)
-	if err != nil {
-		c.log().Errorw("failed to respond to re-INVITE", err)
-		return
-	}
+	// Use the existing helper to respond with proper headers
+	reinviteCC.AcceptAsKeepAlive(currentSDP)
 
 	c.log().Infow("re-INVITE accepted with current SDP")
 }
