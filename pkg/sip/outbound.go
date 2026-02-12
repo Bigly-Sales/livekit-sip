@@ -600,6 +600,17 @@ func (c *outboundCall) sipSignal(ctx context.Context, tid traceid.ID) error {
 		c.log.Infow("SIP invite failed", "error", err)
 		return err
 	}
+
+	// Register in byCallID IMMEDIATELY after Invite() returns to avoid race condition
+	// where RE-INVITE arrives before we've finished processing but after the 200 OK.
+	// This ensures RE-INVITEs can be properly routed to this outbound call.
+	sipCallID := c.cc.SIPCallID()
+	c.c.cmu.Lock()
+	c.c.byCallID[sipCallID] = c
+	c.c.cmu.Unlock()
+	c.log.Debugw("Registered outbound call in byCallID for RE-INVITE handling",
+		"sipCallID", sipCallID)
+
 	c.mon.SDPSize(len(sdpResp), false)
 	c.log.Debugw("SDP answer", "sdp", string(sdpResp))
 
@@ -616,7 +627,7 @@ func (c *outboundCall) sipSignal(ctx context.Context, tid traceid.ID) error {
 
 	c.c.cmu.Lock()
 	c.c.byRemote[c.cc.Tag()] = c
-	c.c.byCallID[c.cc.SIPCallID()] = c
+	// Note: byCallID was already registered above, no need to register again
 	c.c.cmu.Unlock()
 
 	c.mon.InviteAccept()
