@@ -356,12 +356,40 @@ func (s *Server) processInvite(req *sip.Request, tx sip.ServerTransaction) (retE
 
 	s.cmu.RLock()
 	existing := s.byCallID[cc.SIPCallID()]
+	numInboundCalls := len(s.byCallID)
 	s.cmu.RUnlock()
+
 	if existing != nil && existing.cc.InviteCSeq() < cc.InviteCSeq() {
-		log.Infow("accepting reinvite", "sipCallID", existing.cc.ID(), "content-type", req.ContentType(), "content-length", req.ContentLength())
-		existing.log().Infow("reinvite", "content-type", req.ContentType(), "content-length", req.ContentLength(), "cseq", cc.InviteCSeq())
+		// RE-INVITE for an inbound call - handle as keep-alive
+		log.Infow("RE-INVITE received for inbound call",
+			"sipCallID", cc.SIPCallID(),
+			"localTag", existing.cc.ID(),
+			"prevCSeq", existing.cc.InviteCSeq(),
+			"newCSeq", cc.InviteCSeq(),
+			"content-type", req.ContentType(),
+			"content-length", req.ContentLength())
+		existing.log().Infow("processing RE-INVITE as keep-alive",
+			"content-type", req.ContentType(),
+			"content-length", req.ContentLength(),
+			"cseq", cc.InviteCSeq())
 		cc.AcceptAsKeepAlive(existing.cc.OwnSDP())
 		return nil
+	}
+
+	// Check if this is a RE-INVITE for an outbound call (handled by Client)
+	if existing == nil && s.sipUnhandled != nil {
+		log.Debugw("INVITE not found in inbound calls, checking outbound",
+			"sipCallID", cc.SIPCallID(),
+			"cseq", cc.InviteCSeq(),
+			"numInboundCalls", numInboundCalls)
+		if s.sipUnhandled(req, tx) {
+			log.Infow("RE-INVITE handled by client (outbound call)",
+				"sipCallID", cc.SIPCallID(),
+				"cseq", cc.InviteCSeq())
+			return nil
+		}
+		log.Debugw("INVITE not handled by client, treating as new inbound call",
+			"sipCallID", cc.SIPCallID())
 	}
 
 	from, to := cc.From(), cc.To()

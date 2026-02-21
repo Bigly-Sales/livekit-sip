@@ -333,6 +333,9 @@ func (c *outboundCall) close(err error, status CallStatus, description string, r
 		if tag := c.cc.Tag(); tag != "" {
 			delete(c.c.byRemote, tag)
 		}
+		if sipCallID := c.cc.SIPCallID(); sipCallID != "" {
+			delete(c.c.byCallID, sipCallID)
+		}
 		c.c.cmu.Unlock()
 
 		c.c.DeregisterTransferSIPParticipant(string(c.cc.ID()))
@@ -597,6 +600,17 @@ func (c *outboundCall) sipSignal(ctx context.Context, tid traceid.ID) error {
 		c.log.Infow("SIP invite failed", "error", err)
 		return err
 	}
+
+	// Register in byCallID IMMEDIATELY after Invite() returns to avoid race condition
+	// where RE-INVITE arrives before we've finished processing but after the 200 OK.
+	// This ensures RE-INVITEs can be properly routed to this outbound call.
+	sipCallID := c.cc.SIPCallID()
+	c.c.cmu.Lock()
+	c.c.byCallID[sipCallID] = c
+	c.c.cmu.Unlock()
+	c.log.Debugw("Registered outbound call in byCallID for RE-INVITE handling",
+		"sipCallID", sipCallID)
+
 	c.mon.SDPSize(len(sdpResp), false)
 	c.log.Debugw("SDP answer", "sdp", string(sdpResp))
 
@@ -613,6 +627,7 @@ func (c *outboundCall) sipSignal(ctx context.Context, tid traceid.ID) error {
 
 	c.c.cmu.Lock()
 	c.c.byRemote[c.cc.Tag()] = c
+	// Note: byCallID was already registered above, no need to register again
 	c.c.cmu.Unlock()
 
 	c.mon.InviteAccept()
@@ -917,6 +932,42 @@ func (c *sipOutbound) AcceptBye(req *sip.Request, tx sip.ServerTransaction) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.drop() // mark as closed
+}
+
+// AcceptReInvite handles a mid-dialog RE-INVITE request (e.g., session timer refresh, keep-alive).
+// It responds with 200 OK and our original SDP answer.
+func (c *sipOutbound) AcceptReInvite(req *sip.Request, tx sip.ServerTransaction) {
+	c.mu.RLock()
+	// Get our SDP from the original INVITE OK response
+	var sdp []byte
+	var hasInviteOk bool
+	if c.inviteOk != nil {
+		sdp = c.inviteOk.Body()
+		hasInviteOk = true
+	}
+	callID := c.callID
+	tag := c.tag
+	c.mu.RUnlock()
+
+	c.log.Infow("AcceptReInvite: preparing 200 OK response",
+		"sipCallID", callID,
+		"remoteTag", tag,
+		"hasInviteOk", hasInviteOk,
+		"sdpSize", len(sdp))
+
+	// Respond with 200 OK and our SDP
+	resp := sip.NewResponseFromRequest(req, sip.StatusOK, "OK", sdp)
+	resp.AppendHeader(sip.NewHeader("Content-Type", "application/sdp"))
+	resp.AppendHeader(c.contact)
+
+	if err := tx.Respond(resp); err != nil {
+		c.log.Warnw("AcceptReInvite: failed to send 200 OK response", err,
+			"sipCallID", callID)
+	} else {
+		c.log.Infow("AcceptReInvite: successfully sent 200 OK response",
+			"sipCallID", callID,
+			"sdpSize", len(sdp))
+	}
 }
 
 func (c *sipOutbound) AckInviteOK(ctx context.Context) error {

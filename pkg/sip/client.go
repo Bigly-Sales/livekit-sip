@@ -66,6 +66,7 @@ type Client struct {
 	cmu         sync.Mutex
 	activeCalls map[LocalTag]*outboundCall
 	byRemote    map[RemoteTag]*outboundCall
+	byCallID    map[string]*outboundCall // indexed by SIP Call-ID for RE-INVITE handling
 
 	handler      Handler
 	getIOClient  GetIOInfoClient
@@ -105,6 +106,7 @@ func NewClient(region string, conf *config.Config, log logger.Logger, mon *stats
 		getRoom:      DefaultGetRoomFunc,
 		activeCalls:  make(map[LocalTag]*outboundCall),
 		byRemote:     make(map[RemoteTag]*outboundCall),
+		byCallID:     make(map[string]*outboundCall),
 	}
 	for _, option := range options {
 		option(c)
@@ -151,6 +153,7 @@ func (c *Client) Stop() {
 	calls := maps.Values(c.activeCalls)
 	c.activeCalls = make(map[LocalTag]*outboundCall)
 	c.byRemote = make(map[RemoteTag]*outboundCall)
+	c.byCallID = make(map[string]*outboundCall)
 	c.cmu.Unlock()
 	for _, call := range calls {
 		call.Close()
@@ -323,11 +326,55 @@ func (c *Client) OnRequest(req *sip.Request, tx sip.ServerTransaction) bool {
 	switch req.Method {
 	default:
 		return false
+	case "INVITE":
+		return c.onInvite(req, tx)
 	case "BYE":
 		return c.onBye(req, tx)
 	case "NOTIFY":
 		return c.onNotify(req, tx)
 	}
+}
+
+func (c *Client) onInvite(req *sip.Request, tx sip.ServerTransaction) bool {
+	// Get SIP Call-ID to look up existing outbound call
+	callIDHeader := req.CallID()
+	if callIDHeader == nil {
+		c.log.Debugw("onInvite: no Call-ID header in request")
+		return false
+	}
+	sipCallID := callIDHeader.Value()
+
+	// Get CSeq for logging
+	var cseq uint32
+	if cseqHeader := req.CSeq(); cseqHeader != nil {
+		cseq = cseqHeader.SeqNo
+	}
+
+	c.cmu.Lock()
+	call := c.byCallID[sipCallID]
+	numOutboundCalls := len(c.byCallID)
+	c.cmu.Unlock()
+
+	if call == nil {
+		// Not an outbound call we know about
+		c.log.Debugw("onInvite: no outbound call found for SIP Call-ID",
+			"sipCallID", sipCallID,
+			"cseq", cseq,
+			"numOutboundCalls", numOutboundCalls)
+		return false
+	}
+
+	// This is a RE-INVITE for an outbound call
+	call.log.Infow("RE-INVITE received for outbound call",
+		"sipCallID", sipCallID,
+		"cseq", cseq,
+		"fromTag", call.cc.Tag(),
+		"content-type", req.ContentType(),
+		"content-length", req.ContentLength())
+
+	// Handle as keep-alive: respond with our current SDP
+	call.cc.AcceptReInvite(req, tx)
+	return true
 }
 
 func (c *Client) onBye(req *sip.Request, tx sip.ServerTransaction) bool {
