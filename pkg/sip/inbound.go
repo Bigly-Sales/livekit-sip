@@ -320,8 +320,9 @@ func (s *Server) onInvite(log *slog.Logger, req *sip.Request, tx sip.ServerTrans
 				return
 			}
 
-			// To tag present but not found in our dialogs
-			// This could be a stray request for a dialog that already ended
+			// To tag present but not found in our (inbound) dialogs.
+			// This could be a re-INVITE for an outbound call, which is handled
+			// later in processInvite via s.cli.getActiveCall(). Fall through.
 			log.Warn("INVITE with unknown To tag, treating as new call",
 				"toTag", toTag)
 		}
@@ -391,7 +392,7 @@ func (s *Server) processInvite(req *sip.Request, tx sip.ServerTransaction) (retE
 	s.cmu.RUnlock()
 	if existing != nil && existing.cc.InviteCSeq() < cc.InviteCSeq() {
 		existing.log().Infow("reinvite", "content-type", req.ContentType(), "content-length", req.ContentLength(), "cseq", cc.InviteCSeq())
-		cc.AcceptAsKeepAlive(existing.cc.OwnSDP())
+		cc.AcceptAsKeepAlive(tx, req, existing.cc.OwnSDP())
 		return nil
 	}
 	if s.cli != nil { // Process reinvite for existing outbound calls
@@ -402,7 +403,7 @@ func (s *Server) processInvite(req *sip.Request, tx sip.ServerTransaction) (retE
 			if len(sdp) != 0 {
 				oc.log.Infow("accepting reinvite", "content-type", req.ContentType(), "content-length", req.ContentLength(), "cseq", cc.InviteCSeq())
 				oc.cc.RecordInvite(newCSeq)
-				cc.AcceptAsKeepAlive(sdp)
+				cc.AcceptAsKeepAlive(tx, req, sdp)
 				return nil
 			}
 		}
@@ -1370,7 +1371,7 @@ func (c *inboundCall) handleReinvite(req *sip.Request, tx sip.ServerTransaction)
 	// For now, we respond with the same SDP (session refresh, no renegotiation)
 	// TODO: Support SDP renegotiation if needed in the future
 	//       This would require parsing the offer, updating media session, etc.
-	c.cc.AcceptAsKeepAlive(tx, req)
+	c.cc.AcceptAsKeepAlive(tx, req, c.cc.OwnSDP())
 }
 
 func (c *inboundCall) Close() error {
@@ -1858,14 +1859,13 @@ func (c *sipInbound) accepted(inviteOK *sip.Response) {
 	c.inviteTx = nil
 }
 
-func (c *sipInbound) AcceptAsKeepAlive(tx sip.ServerTransaction, invite *sip.Request) {
-	lastSDP := c.OwnSDP()
-	if len(lastSDP) == 0 {
+func (c *sipInbound) AcceptAsKeepAlive(tx sip.ServerTransaction, invite *sip.Request, sdp []byte) {
+	if len(sdp) == 0 {
 		c.log.Errorw("no SDP available for re-INVITE response", nil)
 		_ = tx.Respond(sip.NewResponseFromRequest(invite, sip.StatusInternalServerError, "No SDP available", nil))
 		return
 	}
-	c.respondWithDataTo(tx, invite, sip.StatusOK, "OK", "application/sdp", lastSDP)
+	c.respondWithDataTo(tx, invite, sip.StatusOK, "OK", "application/sdp", sdp)
 	c.log.Infow("re-INVITE accepted with current SDP")
 }
 
