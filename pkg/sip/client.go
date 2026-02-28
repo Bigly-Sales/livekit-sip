@@ -64,6 +64,8 @@ type Client struct {
 	closing     core.Fuse
 	cmu         sync.Mutex
 	activeCalls map[LocalTag]*outboundCall
+	byRemote    map[RemoteTag]*outboundCall
+	byCallID    map[string]*outboundCall
 
 	handler      Handler
 	getIOClient  GetIOInfoClient
@@ -102,6 +104,8 @@ func NewClient(region string, conf *config.Config, log logger.Logger, mon *stats
 		getSipClient: DefaultGetSipClientFunc,
 		getRoom:      DefaultGetRoomFunc,
 		activeCalls:  make(map[LocalTag]*outboundCall),
+		byRemote:     make(map[RemoteTag]*outboundCall),
+		byCallID:     make(map[string]*outboundCall),
 	}
 	for _, option := range options {
 		option(c)
@@ -150,6 +154,8 @@ func (c *Client) Stop() {
 	c.cmu.Lock()
 	calls := maps.Values(c.activeCalls)
 	c.activeCalls = make(map[LocalTag]*outboundCall)
+	c.byRemote = make(map[RemoteTag]*outboundCall)
+	c.byCallID = make(map[string]*outboundCall)
 	c.cmu.Unlock()
 	for _, call := range calls {
 		call.Close(ctx)
@@ -329,11 +335,35 @@ func (c *Client) OnRequest(req *sip.Request, tx sip.ServerTransaction) bool {
 	switch req.Method {
 	default:
 		return false
+	case "INVITE":
+		return c.onInvite(req, tx)
 	case "BYE":
 		return c.onBye(req, tx)
 	case "NOTIFY":
 		return c.onNotify(req, tx)
 	}
+}
+
+// onInvite handles mid-dialog re-INVITEs for outbound calls (e.g. session refresh/keep-alive).
+func (c *Client) onInvite(req *sip.Request, tx sip.ServerTransaction) bool {
+	callID := ""
+	if h := req.CallID(); h != nil {
+		callID = h.Value()
+	}
+	if callID == "" {
+		return false
+	}
+
+	c.cmu.Lock()
+	call := c.byCallID[callID]
+	c.cmu.Unlock()
+	if call == nil {
+		c.log.Infow("re-INVITE for unknown outbound call", "sipCallID", callID)
+		return false
+	}
+	call.log.Infow("re-INVITE from remote for outbound call", "sipCallID", callID)
+	call.cc.AcceptReInvite(req, tx)
+	return true
 }
 
 func (c *Client) onBye(req *sip.Request, tx sip.ServerTransaction) bool {
