@@ -1008,16 +1008,20 @@ func (c *sipOutbound) AcceptReInvite(req *sip.Request, tx sip.ServerTransaction)
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 
-	// Use our original SDP offer as the response body
-	var sdpBody []byte
-	if c.invite != nil {
-		sdpBody = c.invite.Body()
-	}
+	// Use our stored SDP offer (independent copy, not from the request object).
+	// We must respond with OUR media info so the remote knows where to send audio.
+	// Using the request body or stale references would echo the remote's SDP back,
+	// causing the remote to loop audio to itself.
+	sdpBody := c.localSDP
 	if len(sdpBody) == 0 {
 		c.log.Errorw("no SDP available for outbound re-INVITE response", nil)
 		_ = tx.Respond(sip.NewResponseFromRequest(req, sip.StatusInternalServerError, "No SDP available", nil))
 		return
 	}
+
+	c.log.Debugw("outbound re-INVITE SDP",
+		"responseSDP", string(sdpBody),
+		"requestSDP", string(req.Body()))
 
 	resp := sip.NewResponseFromRequest(req, sip.StatusOK, "OK", sdpBody)
 	resp.AppendHeader(&contentTypeHeaderSDP)
@@ -1157,6 +1161,7 @@ func (c *sipOutbound) sendCancel(ctx context.Context) {
 func (c *sipOutbound) drop() {
 	c.invite = nil
 	c.inviteOk = nil
+	c.localSDP = nil
 	c.nextCSeq = 0
 }
 
