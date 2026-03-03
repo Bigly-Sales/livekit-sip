@@ -33,6 +33,7 @@ import (
 	"github.com/livekit/media-sdk/dtmf"
 	"github.com/livekit/media-sdk/sdp"
 	"github.com/livekit/media-sdk/tones"
+	psdp "github.com/pion/sdp/v3"
 	"github.com/livekit/protocol/livekit"
 	"github.com/livekit/protocol/logger"
 	"github.com/livekit/protocol/utils/guid"
@@ -784,6 +785,7 @@ type sipOutbound struct {
 	callID     string
 	invite     *sip.Request
 	inviteOk   *sip.Response
+	ownSDP     []byte // our SDP offer, stored separately to avoid stale request body references
 	to         *sip.ToHeader
 	nextCSeq   uint32
 	getHeaders setHeadersFunc
@@ -936,6 +938,11 @@ authLoop:
 	}
 
 	c.invite, c.inviteOk = req, resp
+	// Store our SDP offer as an independent copy. We cannot rely on c.invite.Body()
+	// because sipgo's Body() returns a reference to the request's internal buffer,
+	// which may become stale after the transaction is terminated.
+	c.ownSDP = make([]byte, len(sdpOffer))
+	copy(c.ownSDP, sdpOffer)
 	toHeader = resp.To()
 	if toHeader == nil {
 		return nil, errors.New("no To header in INVITE response")
@@ -969,16 +976,20 @@ func (c *sipOutbound) AcceptReInvite(req *sip.Request, tx sip.ServerTransaction)
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 
-	// Use our original SDP offer as the response body
-	var sdpBody []byte
-	if c.invite != nil {
-		sdpBody = c.invite.Body()
-	}
+	// Use our stored SDP offer (independent copy, not from the request object).
+	// We must respond with OUR media info so the remote knows where to send audio.
+	// Using the request body or stale references would echo the remote's SDP back,
+	// causing the remote to loop audio to itself.
+	sdpBody := c.ownSDP
 	if len(sdpBody) == 0 {
 		c.log.Errorw("no SDP available for outbound re-INVITE response", nil)
 		_ = tx.Respond(sip.NewResponseFromRequest(req, sip.StatusInternalServerError, "No SDP available", nil))
 		return
 	}
+
+	c.log.Debugw("outbound re-INVITE SDP",
+		"responseSDP", string(sdpBody),
+		"requestSDP", string(req.Body()))
 
 	resp := sip.NewResponseFromRequest(req, sip.StatusOK, "OK", sdpBody)
 	resp.AppendHeader(&contentTypeHeaderSDP)
@@ -987,6 +998,76 @@ func (c *sipOutbound) AcceptReInvite(req *sip.Request, tx sip.ServerTransaction)
 		c.log.Errorw("failed to respond to re-INVITE", err)
 	} else {
 		c.log.Infow("outbound re-INVITE accepted with current SDP")
+	}
+}
+
+// handleReInvite processes a mid-dialog re-INVITE with SDP direction negotiation.
+// It parses the incoming SDP to extract direction and media address, computes the
+// RFC 3264 complement direction, and responds with our SDP modified accordingly.
+// Falls back to AcceptReInvite for re-INVITEs without SDP or on parse failure.
+func (c *outboundCall) handleReInvite(req *sip.Request, tx sip.ServerTransaction) {
+	reqBody := req.Body()
+	if len(reqBody) == 0 {
+		// No SDP in re-INVITE, treat as session refresh
+		c.cc.AcceptReInvite(req, tx)
+		return
+	}
+
+	// Parse incoming SDP
+	incomingSDP := new(psdp.SessionDescription)
+	if err := incomingSDP.Unmarshal(reqBody); err != nil {
+		c.log.Warnw("failed to parse re-INVITE SDP, falling back to simple accept", err)
+		c.cc.AcceptReInvite(req, tx)
+		return
+	}
+
+	// Extract direction from incoming SDP and compute complement
+	inDir := getMediaDirection(incomingSDP)
+	outDir := complementDirection(inDir)
+
+	c.log.Infow("processing outbound re-INVITE SDP",
+		"incomingDirection", inDir,
+		"responseDirection", outDir)
+
+	// Update media destination if remote address changed (e.g., after call transfer).
+	// Skip 0.0.0.0 which indicates hold — we don't want to send RTP to a null address.
+	if remoteAddr, ok := getRemoteMediaAddr(incomingSDP); ok && remoteAddr.IsValid() && !remoteAddr.Addr().IsUnspecified() {
+		if c.media != nil {
+			c.media.SetMediaDst(remoteAddr)
+			c.log.Infow("updated media destination from re-INVITE", "remoteAddr", remoteAddr)
+		}
+	}
+
+	// Get our SDP and modify direction
+	c.cc.mu.RLock()
+	ownSDP := c.cc.ownSDP
+	contact := c.cc.contact
+	c.cc.mu.RUnlock()
+
+	if len(ownSDP) == 0 {
+		c.log.Errorw("no SDP available for outbound re-INVITE response", nil)
+		_ = tx.Respond(sip.NewResponseFromRequest(req, sip.StatusInternalServerError, "No SDP available", nil))
+		return
+	}
+
+	// Set complement direction on our SDP
+	responseSDP, err := setMediaDirection(ownSDP, outDir)
+	if err != nil {
+		c.log.Warnw("failed to set direction on response SDP, using original", err)
+		responseSDP = ownSDP
+	}
+
+	c.log.Debugw("outbound re-INVITE SDP",
+		"responseSDP", string(responseSDP),
+		"requestSDP", string(reqBody))
+
+	resp := sip.NewResponseFromRequest(req, sip.StatusOK, "OK", responseSDP)
+	resp.AppendHeader(&contentTypeHeaderSDP)
+	resp.AppendHeader(contact)
+	if err := tx.Respond(resp); err != nil {
+		c.log.Errorw("failed to respond to re-INVITE", err)
+	} else {
+		c.log.Infow("outbound re-INVITE accepted", "direction", outDir)
 	}
 }
 
@@ -1118,6 +1199,7 @@ func (c *sipOutbound) sendCancel(ctx context.Context) {
 func (c *sipOutbound) drop() {
 	c.invite = nil
 	c.inviteOk = nil
+	c.ownSDP = nil
 	c.nextCSeq = 0
 }
 
