@@ -136,6 +136,7 @@ func (c *Client) newCall(ctx context.Context, tid traceid.ID, conf *config.Confi
 		}
 		return AttrsToHeaders(r.LocalParticipant.Attributes(), c.sipConf.attrsToHeaders, headers)
 	})
+	call.cc.parentCall = call // enable early byCallID registration inside Invite()
 
 	call.mon = c.mon.NewCall(stats.Outbound, sipConf.host, sipConf.address)
 	var err error
@@ -774,11 +775,12 @@ func (c *Client) newOutbound(log logger.Logger, id LocalTag, from, contact URI, 
 }
 
 type sipOutbound struct {
-	log     logger.Logger
-	c       *Client
-	id      LocalTag
-	from    *sip.FromHeader
-	contact *sip.ContactHeader
+	log        logger.Logger
+	c          *Client
+	id         LocalTag
+	from       *sip.FromHeader
+	contact    *sip.ContactHeader
+	parentCall *outboundCall // back-reference for early byCallID registration
 
 	mu         sync.RWMutex
 	tag        RemoteTag
@@ -850,6 +852,15 @@ func (c *sipOutbound) Invite(ctx context.Context, to URI, user, pass string, hea
 
 	c.callID = guid.HashedID(fmt.Sprintf("%s-%s", string(c.id), toHeader.Address.String()))
 	c.log = c.log.WithValues("sipCallID", c.callID)
+
+	// Register in byCallID early so that re-INVITEs from the remote arriving
+	// before the 200 OK (e.g., SBC session refresh) can be routed to this call
+	// instead of being misidentified as new inbound calls.
+	if c.parentCall != nil {
+		c.c.cmu.Lock()
+		c.c.byCallID[c.callID] = c.parentCall
+		c.c.cmu.Unlock()
+	}
 
 	var (
 		sipHeaders         Headers
