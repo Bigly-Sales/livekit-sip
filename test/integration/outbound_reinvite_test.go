@@ -600,3 +600,299 @@ func TestSIPOutboundReInviteCallDrop(t *testing.T) {
 
 	t.Log("PASS: outbound re-INVITE handled correctly, call still active")
 }
+
+// reInviteResult captures the outcome of a re-INVITE sent by the UAS
+// immediately after answering the initial INVITE.
+type reInviteResult struct {
+	tx   sip.ClientTransaction
+	req  *sip.Request
+	resp *sip.Response
+	err  error
+}
+
+// setupUASWithImmediateReInvite creates a UAS that sends a re-INVITE
+// immediately after answering the initial INVITE with 200 OK. This
+// reproduces the exact production timing where an SBC sends a session
+// refresh re-INVITE before the SIP service has finished processing the
+// 200 OK (before sipSignal completes late byCallID registration).
+//
+// The re-INVITE is sent inside the OnInvite handler, right after the
+// 200 OK response, maximizing the chance it arrives during the INVITE
+// transaction processing window.
+func setupUASWithImmediateReInvite(t *testing.T, remoteNumber string) (*uasConfig, chan reInviteResult) {
+	t.Helper()
+
+	localIP, err := config.GetLocalIP()
+	require.NoError(t, err)
+
+	uasPort := 5060 + rand.Intn(1000)
+	uasLog := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	ua, err := sipgo.NewUA(
+		sipgo.WithUserAgent(remoteNumber),
+		sipgo.WithUserAgentLogger(uasLog),
+	)
+	require.NoError(t, err)
+
+	uasClient, err := sipgo.NewClient(ua, sipgo.WithClientHostname(localIP.String()))
+	require.NoError(t, err)
+	t.Cleanup(func() { uasClient.Close() })
+
+	uasServer, err := sipgo.NewServer(ua)
+	require.NoError(t, err)
+	t.Cleanup(func() { uasServer.Close() })
+
+	dialogCh := make(chan dialogState, 1)
+	byeCh := make(chan struct{}, 1)
+	reInviteCh := make(chan reInviteResult, 1)
+
+	createSDP := func() []byte {
+		offer := sdp.SessionDescription{
+			Version: 0,
+			Origin: sdp.Origin{
+				Username:       "-",
+				SessionID:      rand.Uint64(),
+				SessionVersion: 1,
+				NetworkType:    "IN",
+				AddressType:    "IP4",
+				UnicastAddress: localIP.String(),
+			},
+			SessionName: "TestUAS",
+			ConnectionInformation: &sdp.ConnectionInformation{
+				NetworkType: "IN",
+				AddressType: "IP4",
+				Address:     &sdp.Address{Address: localIP.String()},
+			},
+			TimeDescriptions: []sdp.TimeDescription{
+				{Timing: sdp.Timing{StartTime: 0, StopTime: 0}},
+			},
+			MediaDescriptions: []*sdp.MediaDescription{
+				{
+					MediaName: sdp.MediaName{
+						Media:   "audio",
+						Port:    sdp.RangedPort{Value: 30000 + rand.Intn(1000)},
+						Protos:  []string{"RTP", "AVP"},
+						Formats: []string{"0"},
+					},
+					Attributes: []sdp.Attribute{
+						{Key: "rtpmap", Value: "0 PCMU/8000"},
+					},
+				},
+			},
+		}
+		b, _ := offer.Marshal()
+		return b
+	}
+
+	uas := &uasConfig{
+		ua:        ua,
+		server:    uasServer,
+		client:    uasClient,
+		localIP:   localIP,
+		port:      uasPort,
+		addr:      fmt.Sprintf("%s:%d", localIP, uasPort),
+		createSDP: createSDP,
+		dialogCh:  dialogCh,
+		byeCh:     byeCh,
+	}
+
+	uasServer.OnInvite(func(log *slog.Logger, req *sip.Request, tx sip.ServerTransaction) {
+		t.Log("UAS: received INVITE from SIP service")
+
+		sdpBody := createSDP()
+		resp := sip.NewResponseFromRequest(req, 200, "OK", sdpBody)
+		resp.AppendHeader(sip.NewHeader("Content-Type", "application/sdp"))
+		resp.AppendHeader(sip.NewHeader("Contact",
+			fmt.Sprintf("<sip:%s@%s:%d>", remoteNumber, localIP, uasPort)))
+
+		if err := tx.Respond(resp); err != nil {
+			t.Errorf("UAS: failed to respond to INVITE: %v", err)
+			return
+		}
+
+		t.Log("UAS: sent 200 OK, immediately sending re-INVITE to test early byCallID registration")
+
+		// Send re-INVITE IMMEDIATELY — before ACK, before the SIP service
+		// has finished processing the 200 OK. This is the exact window
+		// where the bug occurred in production.
+		dlg := dialogState{req: req, resp: resp}
+		dialogCh <- dlg
+
+		reinviteTx, reinviteReq, err := uas.sendReInvite(t, dlg, remoteNumber)
+		if err != nil {
+			reInviteCh <- reInviteResult{err: err}
+			return
+		}
+
+		t.Log("UAS: re-INVITE sent, waiting for response")
+		reinviteResp := waitForFinalResponse(t, reinviteTx, 15*time.Second)
+		reInviteCh <- reInviteResult{
+			tx:   reinviteTx,
+			req:  reinviteReq,
+			resp: reinviteResp,
+		}
+	})
+
+	uasServer.OnAck(func(log *slog.Logger, req *sip.Request, tx sip.ServerTransaction) {
+		t.Log("UAS: received ACK")
+	})
+
+	uasServer.OnBye(func(log *slog.Logger, req *sip.Request, tx sip.ServerTransaction) {
+		t.Log("UAS: received BYE")
+		_ = tx.Respond(sip.NewResponseFromRequest(req, 200, "OK", nil))
+		select {
+		case byeCh <- struct{}{}:
+		default:
+		}
+	})
+
+	lis, err := net.ListenTCP("tcp4", &net.TCPAddr{Port: uasPort})
+	require.NoError(t, err)
+	t.Cleanup(func() { lis.Close() })
+	go uasServer.ServeTCP(lis)
+
+	t.Logf("UAS (immediate re-INVITE) listening on %s", uas.addr)
+
+	return uas, reInviteCh
+}
+
+// TestSIPOutboundReInviteImmediatelyAfterAnswer reproduces the exact production
+// timing bug: the SBC sends a re-INVITE immediately after answering the initial
+// INVITE with 200 OK, before the SIP service has finished processing the 200 OK
+// and completed the late byCallID registration in sipSignal().
+//
+// Without the early byCallID registration fix:
+//   - The re-INVITE arrives while byCallID is still empty
+//   - It falls through to the inbound call pipeline
+//   - With a matching inbound trunk: 486 Busy → BYE kills the call
+//   - Without a matching inbound trunk: silent drop or timeout
+//
+// With the fix:
+//   - byCallID is populated inside Invite() before the INVITE is sent
+//   - The re-INVITE is found and handled within the existing dialog → 200 OK
+func TestSIPOutboundReInviteImmediatelyAfterAnswer(t *testing.T) {
+	lk := runLiveKit(t)
+
+	const (
+		roomName     = "test-outbound-reinvite-immediate"
+		outIdentity  = "siptest_outbound_immediate"
+		outName      = "Outbound Call Immediate"
+		outMeta      = `{"test":true}`
+		remoteNumber = "+444444444"
+		inboundRoom  = "inbound-immediate-reinvite"
+	)
+
+	srv := runSIPServer(t, lk)
+	uas, reInviteCh := setupUASWithImmediateReInvite(t, remoteNumber)
+
+	// --- Create an inbound trunk that matches the reversed direction ---
+	// This makes the test more realistic: without the fix, the re-INVITE
+	// would match this inbound trunk and get processed as a new inbound call.
+	trunkIn := srv.CreateTrunkIn(t, &livekit.SIPInboundTrunkInfo{
+		Name:    "Test Inbound (immediate re-INVITE)",
+		Numbers: []string{clientNumber},
+	})
+	t.Cleanup(func() {
+		srv.DeleteTrunk(t, trunkIn)
+	})
+
+	ruleIn := srv.CreateDirectDispatch(t, inboundRoom, "", "", nil)
+	t.Cleanup(func() {
+		srv.DeleteDispatch(t, ruleIn)
+	})
+
+	// --- Create outbound trunk and initiate the call ---
+
+	trunkOut := srv.CreateTrunkOut(t, &livekit.SIPOutboundTrunkInfo{
+		Name:      "Test Outbound Immediate ReInvite",
+		Numbers:   []string{clientNumber},
+		Address:   uas.addr,
+		Transport: livekit.SIPTransport_SIP_TRANSPORT_TCP,
+	})
+	t.Cleanup(func() {
+		srv.DeleteTrunk(t, trunkOut)
+	})
+
+	// Initiate the outbound call.
+	lk.LiveKit.CreateSIPParticipant(t, &livekit.CreateSIPParticipantRequest{
+		SipTrunkId:          trunkOut,
+		SipCallTo:           remoteNumber,
+		RoomName:            roomName,
+		ParticipantIdentity: outIdentity,
+		ParticipantName:     outName,
+		ParticipantMetadata: outMeta,
+	})
+
+	// Wait for the UAS to receive the INVITE — the UAS will send re-INVITE
+	// immediately after answering, so we just need the dialog state.
+	select {
+	case <-uas.dialogCh:
+		t.Log("Dialog established, UAS is sending immediate re-INVITE")
+	case <-time.After(30 * time.Second):
+		t.Fatal("Timeout waiting for INVITE from SIP service")
+	}
+
+	// Wait for the re-INVITE result from the UAS.
+	var result reInviteResult
+	select {
+	case result = <-reInviteCh:
+		t.Log("Received re-INVITE result from UAS")
+	case <-time.After(20 * time.Second):
+		t.Fatal("Timeout waiting for re-INVITE result — " +
+			"re-INVITE was likely silently dropped")
+	}
+
+	require.NoError(t, result.err, "re-INVITE transaction should not fail")
+	if result.tx != nil {
+		defer result.tx.Terminate()
+	}
+
+	// This is the critical assertion:
+	// - With the fix: 200 OK (byCallID was populated early, before 200 OK processing)
+	// - Without the fix: 486/timeout (byCallID was empty, re-INVITE misrouted)
+	require.NotNil(t, result.resp,
+		"expected a final response to immediate re-INVITE, got timeout — "+
+			"this means the re-INVITE was NOT found in byCallID "+
+			"(early registration is broken)")
+
+	t.Logf("Immediate re-INVITE response: %d %s", result.resp.StatusCode, result.resp.Reason)
+	require.Equal(t, 200, int(result.resp.StatusCode),
+		"immediate re-INVITE should be accepted with 200 OK, but got %d %s — "+
+			"this means the re-INVITE arrived before byCallID was populated "+
+			"and was misidentified as a new inbound call",
+		result.resp.StatusCode, result.resp.Reason)
+
+	// Verify the response contains our SDP, not echoed carrier SDP
+	require.NotEmpty(t, result.resp.Body(), "re-INVITE response should contain SDP")
+	respSDP := new(sdp.SessionDescription)
+	err := respSDP.Unmarshal(result.resp.Body())
+	require.NoError(t, err, "re-INVITE response should contain valid SDP")
+
+	t.Logf("Immediate re-INVITE response SDP session: %q", respSDP.SessionName)
+	require.Equal(t, "LiveKit", string(respSDP.SessionName),
+		"re-INVITE 200 OK must contain LiveKit's SDP, not the carrier's")
+
+	// ACK the 200 OK
+	ackReq := sip.NewAckRequest(result.req, result.resp, nil)
+	err = uas.client.WriteRequest(ackReq)
+	require.NoError(t, err, "ACK for re-INVITE should not fail")
+
+	// Verify the outbound call is still active (not replaced by a spurious inbound call).
+	ctx, cancel := context.WithTimeout(context.Background(), participantsJoinTimeout)
+	defer cancel()
+	lk.ExpectRoomWithParticipants(t, ctx, roomName, []lktest.ParticipantInfo{
+		{
+			Identity: outIdentity,
+			Name:     outName,
+			Kind:     livekit.ParticipantInfo_SIP,
+			Metadata: outMeta,
+			Attributes: map[string]string{
+				"sip.callID":     lktest.AttrTestAny,
+				"sip.callStatus": "active",
+			},
+		},
+	})
+
+	t.Log("PASS: immediate re-INVITE after 200 OK handled correctly — " +
+		"early byCallID registration works")
+}
