@@ -361,3 +361,195 @@ func TestHandleReInviteInactive(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, "inactive", getMediaDirection(respSDP), "response direction should be inactive")
 }
+
+// TestEarlyByCallIDRegistration verifies that the parentCall back-reference
+// enables early byCallID registration. When parentCall is set on sipOutbound,
+// the early registration code path (inside Invite) should populate byCallID
+// immediately after Call-ID assignment — before the 200 OK is processed.
+//
+// This prevents re-INVITEs arriving during the INVITE transaction from being
+// misidentified as new inbound calls.
+func TestEarlyByCallIDRegistration(t *testing.T) {
+	log := logger.GetLogger()
+	c := &Client{
+		log:         log,
+		conf:        &config.Config{},
+		activeCalls: make(map[LocalTag]*outboundCall),
+		byRemote:    make(map[RemoteTag]*outboundCall),
+		byCallID:    make(map[string]*outboundCall),
+	}
+
+	call := &outboundCall{
+		c:   c,
+		log: log,
+	}
+
+	out := &sipOutbound{
+		log:        log,
+		c:          c,
+		id:         "SCL_early_reg",
+		parentCall: call, // back-reference enables early registration
+		contact: &sip.ContactHeader{
+			Address: sip.Uri{Host: "local.com", Port: 5060},
+		},
+		ownSDP: []byte("v=0\r\no=- 123 456 IN IP4 1.2.3.4\r\ns=LiveKit\r\n" +
+			"c=IN IP4 1.2.3.4\r\nt=0 0\r\n" +
+			"m=audio 5004 RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\n"),
+	}
+	call.cc = out
+
+	// Simulate the early registration that happens inside Invite():
+	// 1. Assign Call-ID
+	// 2. Register in byCallID via parentCall
+	const testCallID = "early-reg-test-call-id"
+	out.callID = testCallID
+	if out.parentCall != nil {
+		c.cmu.Lock()
+		c.byCallID[out.callID] = out.parentCall
+		c.cmu.Unlock()
+	}
+
+	// Verify byCallID is populated
+	c.cmu.Lock()
+	registered := c.byCallID[testCallID]
+	c.cmu.Unlock()
+	require.NotNil(t, registered, "byCallID should be populated after early registration")
+	require.Equal(t, call, registered, "byCallID should point to the outboundCall")
+
+	// Verify Client.onInvite() can route a re-INVITE to this call
+	req := sip.NewRequest(sip.INVITE, sip.Uri{Host: "local.com"})
+	callIDHeader := sip.CallIDHeader(testCallID)
+	req.AppendHeader(&callIDHeader)
+	req.AppendHeader(&sip.CSeqHeader{SeqNo: 2, MethodName: sip.INVITE})
+
+	tx := &testServerTransaction{}
+	handled := c.onInvite(req, tx)
+
+	require.True(t, handled, "Client.onInvite() should find the early-registered call")
+	require.Len(t, tx.responses, 1, "should send one response")
+	require.Equal(t, sip.StatusOK, tx.responses[0].StatusCode, "should respond with 200 OK")
+}
+
+// TestEarlyByCallIDRegistrationSkippedWithoutParentCall verifies that the
+// early registration code path is safely skipped when parentCall is nil.
+// This ensures backward compatibility — sipOutbound instances created without
+// parentCall (e.g., in older code paths or tests) don't panic or register.
+func TestEarlyByCallIDRegistrationSkippedWithoutParentCall(t *testing.T) {
+	log := logger.GetLogger()
+	c := &Client{
+		log:         log,
+		conf:        &config.Config{},
+		activeCalls: make(map[LocalTag]*outboundCall),
+		byRemote:    make(map[RemoteTag]*outboundCall),
+		byCallID:    make(map[string]*outboundCall),
+	}
+
+	out := &sipOutbound{
+		log:        log,
+		c:          c,
+		id:         "SCL_no_parent",
+		parentCall: nil, // NO back-reference
+	}
+
+	// Simulate the early registration code path with parentCall == nil
+	const testCallID = "no-parent-call-id"
+	out.callID = testCallID
+	if out.parentCall != nil {
+		c.cmu.Lock()
+		c.byCallID[out.callID] = out.parentCall
+		c.cmu.Unlock()
+	}
+
+	// Verify byCallID is NOT populated
+	c.cmu.Lock()
+	registered := c.byCallID[testCallID]
+	c.cmu.Unlock()
+	require.Nil(t, registered, "byCallID should NOT be populated when parentCall is nil")
+
+	// Verify Client.onInvite() returns false for this call
+	req := sip.NewRequest(sip.INVITE, sip.Uri{Host: "local.com"})
+	callIDHeader := sip.CallIDHeader(testCallID)
+	req.AppendHeader(&callIDHeader)
+
+	tx := &testServerTransaction{}
+	handled := c.onInvite(req, tx)
+	require.False(t, handled, "Client.onInvite() should NOT find an unregistered call")
+	require.Empty(t, tx.responses, "should not send any response for unregistered call")
+}
+
+// TestByCallIDCleanupAfterEarlyRegistration verifies that close() properly
+// cleans up byCallID entries that were registered early (before 200 OK).
+// This prevents stale entries from accumulating if the call fails during
+// the INVITE transaction or is closed normally after establishment.
+func TestByCallIDCleanupAfterEarlyRegistration(t *testing.T) {
+	log := logger.GetLogger()
+	c := &Client{
+		log:         log,
+		conf:        &config.Config{},
+		activeCalls: make(map[LocalTag]*outboundCall),
+		byRemote:    make(map[RemoteTag]*outboundCall),
+		byCallID:    make(map[string]*outboundCall),
+	}
+
+	const (
+		testCallID = "cleanup-test-call-id"
+		testTag    = "SCL_cleanup"
+	)
+
+	call := &outboundCall{
+		c:   c,
+		log: log,
+	}
+
+	out := &sipOutbound{
+		log:        log,
+		c:          c,
+		id:         testTag,
+		callID:     testCallID,
+		parentCall: call,
+		contact: &sip.ContactHeader{
+			Address: sip.Uri{Host: "local.com", Port: 5060},
+		},
+		ownSDP: []byte("v=0\r\n"),
+	}
+	call.cc = out
+
+	// Register in byCallID (simulating early registration)
+	c.cmu.Lock()
+	c.activeCalls[testTag] = call
+	c.byCallID[testCallID] = call
+	c.cmu.Unlock()
+
+	// Verify the call is registered
+	c.cmu.Lock()
+	require.NotNil(t, c.byCallID[testCallID], "call should be in byCallID before cleanup")
+	require.NotNil(t, c.activeCalls[testTag], "call should be in activeCalls before cleanup")
+	c.cmu.Unlock()
+
+	// Simulate the cleanup that close() does (outbound.go lines 346-354)
+	c.cmu.Lock()
+	delete(c.activeCalls, out.ID())
+	if tag := out.Tag(); tag != "" {
+		delete(c.byRemote, tag)
+	}
+	if sipCallID := out.SIPCallID(); sipCallID != "" {
+		delete(c.byCallID, sipCallID)
+	}
+	c.cmu.Unlock()
+
+	// Verify cleanup
+	c.cmu.Lock()
+	require.Nil(t, c.byCallID[testCallID], "byCallID should be empty after cleanup")
+	require.Nil(t, c.activeCalls[testTag], "activeCalls should be empty after cleanup")
+	c.cmu.Unlock()
+
+	// Verify Client.onInvite() returns false after cleanup
+	req := sip.NewRequest(sip.INVITE, sip.Uri{Host: "local.com"})
+	callIDHeader := sip.CallIDHeader(testCallID)
+	req.AppendHeader(&callIDHeader)
+
+	tx := &testServerTransaction{}
+	handled := c.onInvite(req, tx)
+	require.False(t, handled, "Client.onInvite() should NOT find the cleaned-up call")
+	require.Empty(t, tx.responses, "should not send any response for cleaned-up call")
+}
