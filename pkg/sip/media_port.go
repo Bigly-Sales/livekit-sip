@@ -803,7 +803,7 @@ func (p *MediaPort) setupOutput(tid traceid.ID) error {
 		if p.dtmfAudioEnabled {
 			// Add separate mixer for DTMF audio.
 			// TODO: optimize, if we'll ever need this code path
-			mix, err := mixer.NewMixer(audioOut, rtp.DefFrameDur, 1, mixer.WithOutputChannel())
+			mix, err := mixer.NewMixer(audioOut, rtp.DefFrameDur, 1, mixer.WithOutputChannel(), mixer.WithInputBufferFrames(15))
 			if err != nil {
 				return err
 			}
