@@ -1,3 +1,5 @@
+//go:build goexperiment.synctest
+
 // Copyright 2024 LiveKit, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
