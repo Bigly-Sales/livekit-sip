@@ -285,15 +285,16 @@ type MediaConf struct {
 }
 
 type MediaOptions struct {
-	IP                  netip.Addr
-	Ports               rtcconfig.PortRange
-	MediaTimeoutInitial time.Duration
-	MediaTimeout        time.Duration
-	Stats               *PortStats
-	EnableJitterBuffer  bool
-	NoInputResample     bool
-	IgnorePreanswerData bool
-	LogSignalChanges    bool
+	IP                     netip.Addr
+	Ports                  rtcconfig.PortRange
+	MediaTimeoutInitial    time.Duration
+	MediaTimeout           time.Duration
+	Stats                  *PortStats
+	EnableJitterBuffer     bool
+	NoInputResample        bool
+	IgnorePreanswerData    bool
+	LogSignalChanges       bool
+	MixerInputBufferFrames int
 }
 
 func NewMediaPort(tid traceid.ID, log logger.Logger, mon *stats.CallMonitor, opts *MediaOptions, sampleRate int) (*MediaPort, error) {
@@ -798,7 +799,11 @@ func (p *MediaPort) setupOutput(tid traceid.ID) error {
 		if p.dtmfAudioEnabled {
 			// Add separate mixer for DTMF audio.
 			// TODO: optimize, if we'll ever need this code path
-			mix, err := mixer.NewMixer(audioOut, rtp.DefFrameDur, 1, mixer.WithOutputChannel(), mixer.WithInputBufferFrames(15))
+			bufFrames := p.opts.MixerInputBufferFrames
+			if bufFrames <= 0 {
+				bufFrames = DefaultMixerInputBufferFrames
+			}
+			mix, err := mixer.NewMixer(audioOut, rtp.DefFrameDur, 1, mixer.WithOutputChannel(), mixer.WithInputBufferFrames(bufFrames))
 			if err != nil {
 				return err
 			}

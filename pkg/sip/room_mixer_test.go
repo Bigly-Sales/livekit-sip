@@ -40,7 +40,7 @@ const expectedInputBufferMin = expectedInputBufferFrames/2 + 1
 // ~200ms of delivery jitter.
 func TestNewRoomMixerBufferConfig(t *testing.T) {
 	st := &RoomStats{}
-	r := NewRoom(logger.GetLogger(), st)
+	r := NewRoom(logger.GetLogger(), st, expectedInputBufferFrames)
 	defer r.Close()
 
 	inp := r.mix.NewInput()
@@ -93,7 +93,7 @@ func TestNewRoomMixerBufferConfig(t *testing.T) {
 // the restart counter works and the mixer doesn't get stuck.
 func TestNewRoomMixerStarvationRecovery(t *testing.T) {
 	st := &RoomStats{}
-	r := NewRoom(logger.GetLogger(), st)
+	r := NewRoom(logger.GetLogger(), st, expectedInputBufferFrames)
 	defer r.Close()
 
 	inp := r.mix.NewInput()
@@ -148,7 +148,7 @@ func TestNewRoomMixerStarvationRecovery(t *testing.T) {
 // delivered at a steady rate slightly jittered around 20ms.
 func TestNewRoomMixerOutputContinuity(t *testing.T) {
 	st := &RoomStats{}
-	r := NewRoom(logger.GetLogger(), st)
+	r := NewRoom(logger.GetLogger(), st, expectedInputBufferFrames)
 	defer r.Close()
 
 	inp := r.mix.NewInput()

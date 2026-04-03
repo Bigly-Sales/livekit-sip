@@ -102,7 +102,7 @@ func NewClient(region string, conf *config.Config, log logger.Logger, mon *stats
 		mon:          mon,
 		getIOClient:  getIOClient,
 		getSipClient: DefaultGetSipClientFunc,
-		getRoom:      DefaultGetRoomFunc,
+		getRoom:      GetRoomFuncWithMixerBuffer(conf.MixerInputBufferFrames),
 		activeCalls:  make(map[LocalTag]*outboundCall),
 		byRemote:     make(map[RemoteTag]*outboundCall),
 		byCallID:     make(map[string]*outboundCall),

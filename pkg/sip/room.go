@@ -160,8 +160,21 @@ type RoomInterface interface {
 
 type GetRoomFunc func(log logger.Logger, st *RoomStats) RoomInterface
 
+// DefaultMixerInputBufferFrames is used when MixerInputBufferFrames is not set in config.
+const DefaultMixerInputBufferFrames = 15
+
 func DefaultGetRoomFunc(log logger.Logger, st *RoomStats) RoomInterface {
-	return NewRoom(log, st)
+	return NewRoom(log, st, DefaultMixerInputBufferFrames)
+}
+
+// GetRoomFuncWithMixerBuffer returns a GetRoomFunc that uses the specified mixer buffer size.
+func GetRoomFuncWithMixerBuffer(mixerBufferFrames int) GetRoomFunc {
+	if mixerBufferFrames <= 0 {
+		mixerBufferFrames = DefaultMixerInputBufferFrames
+	}
+	return func(log logger.Logger, st *RoomStats) RoomInterface {
+		return NewRoom(log, st, mixerBufferFrames)
+	}
 }
 
 type Room struct {
@@ -198,14 +211,17 @@ type RoomConfig struct {
 	LogSignalChanges bool
 }
 
-func NewRoom(log logger.Logger, st *RoomStats) *Room {
+func NewRoom(log logger.Logger, st *RoomStats, mixerBufferFrames int) *Room {
 	if st == nil {
 		st = &RoomStats{}
+	}
+	if mixerBufferFrames <= 0 {
+		mixerBufferFrames = DefaultMixerInputBufferFrames
 	}
 	r := &Room{log: log, stats: st, out: msdk.NewSwitchWriter(RoomSampleRate)}
 
 	var err error
-	r.mix, err = mixer.NewMixer(r.out, rtp.DefFrameDur, 1, mixer.WithStats(&st.Mixer), mixer.WithOutputChannel(), mixer.WithInputBufferFrames(15))
+	r.mix, err = mixer.NewMixer(r.out, rtp.DefFrameDur, 1, mixer.WithStats(&st.Mixer), mixer.WithOutputChannel(), mixer.WithInputBufferFrames(mixerBufferFrames))
 	if err != nil {
 		panic(err)
 	}

@@ -186,7 +186,7 @@ func NewServer(region string, conf *config.Config, log logger.Logger, mon *stats
 		region:             region,
 		mon:                mon,
 		getIOClient:        getIOClient,
-		getRoom:            DefaultGetRoomFunc,
+		getRoom:            GetRoomFuncWithMixerBuffer(conf.MixerInputBufferFrames),
 		byRemoteTag:        make(map[RemoteTag]*inboundCall),
 		byLocalTag:         make(map[LocalTag]*inboundCall),
 		byCallID:           make(map[string]*inboundCall),

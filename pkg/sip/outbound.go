@@ -140,15 +140,16 @@ func (c *Client) newCall(ctx context.Context, tid traceid.ID, conf *config.Confi
 	var err error
 
 	call.media, err = NewMediaPort(tid, call.log, call.mon, &MediaOptions{
-		IP:                  c.sconf.MediaIP,
-		Ports:               conf.RTPPort,
-		MediaTimeoutInitial: c.conf.MediaTimeoutInitial,
-		MediaTimeout:        c.conf.MediaTimeout,
-		EnableJitterBuffer:  call.jitterBuf,
-		LogSignalChanges:    signalLoggingEnabled,
-		Stats:               &call.stats.Port,
-		NoInputResample:     !RoomResample,
-		IgnorePreanswerData: true,
+		IP:                     c.sconf.MediaIP,
+		Ports:                  conf.RTPPort,
+		MediaTimeoutInitial:    c.conf.MediaTimeoutInitial,
+		MediaTimeout:           c.conf.MediaTimeout,
+		EnableJitterBuffer:     call.jitterBuf,
+		LogSignalChanges:       signalLoggingEnabled,
+		Stats:                  &call.stats.Port,
+		NoInputResample:        !RoomResample,
+		IgnorePreanswerData:    true,
+		MixerInputBufferFrames: conf.MixerInputBufferFrames,
 	}, RoomSampleRate)
 	if err != nil {
 		call.close(ctx, errors.Wrap(err, "media failed"), callDropped, "media-failed", livekit.DisconnectReason_UNKNOWN_REASON)

@@ -4,6 +4,10 @@ go 1.24.2
 
 toolchain go1.24.3
 
+// Local patch: upgrade soxr from LQ→MQ quality, add resampler buffer,
+// reduce mixer clock drift fuzz from /4 to /8
+replace github.com/livekit/media-sdk => ./media-sdk-local
+
 require (
 	github.com/at-wat/ebml-go v0.17.1
 	github.com/frostbyte73/core v0.1.1

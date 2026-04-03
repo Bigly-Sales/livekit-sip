@@ -118,6 +118,11 @@ type Config struct {
 	EnableJitterBuffer     bool    `yaml:"enable_jitter_buffer"`
 	EnableJitterBufferProb float64 `yaml:"enable_jitter_buffer_prob"`
 
+	// MixerInputBufferFrames sets the mixer input ring buffer depth in frames (20ms each).
+	// Larger values absorb more WebRTC delivery jitter but add latency.
+	// Default: 15 (300ms buffer, 160ms min before playback).
+	MixerInputBufferFrames int `yaml:"mixer_input_buffer_frames"`
+
 	// internal
 	ServiceName string `yaml:"-"`
 	NodeID      string // Do not provide, will be overwritten

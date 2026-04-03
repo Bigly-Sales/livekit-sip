@@ -1007,14 +1007,15 @@ func (c *inboundCall) runMediaConn(tid traceid.ID, offerData []byte, enc livekit
 	logSignalChanges := false
 	logSignalChanges, _ = strconv.ParseBool(featureFlags[signalLoggingFeatureFlag])
 	mp, err := NewMediaPort(tid, c.log(), c.mon, &MediaOptions{
-		IP:                  c.s.sconf.MediaIP,
-		Ports:               conf.RTPPort,
-		MediaTimeoutInitial: c.s.conf.MediaTimeoutInitial,
-		MediaTimeout:        c.s.conf.MediaTimeout,
-		EnableJitterBuffer:  c.jitterBuf,
-		LogSignalChanges:    logSignalChanges,
-		Stats:               &c.stats.Port,
-		NoInputResample:     !RoomResample,
+		IP:                     c.s.sconf.MediaIP,
+		Ports:                  conf.RTPPort,
+		MediaTimeoutInitial:    c.s.conf.MediaTimeoutInitial,
+		MediaTimeout:           c.s.conf.MediaTimeout,
+		EnableJitterBuffer:     c.jitterBuf,
+		LogSignalChanges:       logSignalChanges,
+		Stats:                  &c.stats.Port,
+		NoInputResample:        !RoomResample,
+		MixerInputBufferFrames: conf.MixerInputBufferFrames,
 	}, RoomSampleRate)
 	if err != nil {
 		return nil, err
